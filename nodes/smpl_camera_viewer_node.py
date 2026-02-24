@@ -12,19 +12,7 @@ import folder_paths
 
 logger = logging.getLogger("SMPLCameraViewer")
 
-
-def _next_sequential_filename(directory, prefix, ext):
-    """Find the next sequential filename like prefix_0001.ext, prefix_0002.ext, etc."""
-    existing = sorted(directory.glob(f"{prefix}_*{ext}"))
-    max_num = 0
-    for f in existing:
-        stem = f.stem
-        suffix = stem[len(prefix) + 1:]
-        try:
-            max_num = max(max_num, int(suffix))
-        except ValueError:
-            pass
-    return f"{prefix}_{max_num + 1:04d}{ext}"
+from .shared_utils import next_sequential_filename as _next_sequential_filename
 
 
 class SMPLCameraViewer:
@@ -170,8 +158,12 @@ class SMPLCameraViewer:
             logger.info(f"[SMPLCameraViewer] Video: {video_frame_count} frames (SMPL: {num_frames})")
 
         # Run SMPL-X forward pass to get vertices
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        data_dir = Path(__file__).parent / "data"
+        try:
+            import comfy.model_management
+            device = comfy.model_management.get_torch_device()
+        except Exception:
+            device = torch.device("cpu")
+        data_dir = Path(__file__).parent / "body_model"
         models_dir = Path(folder_paths.models_dir) / "motion_capture" / "body_models"
 
         # Ensure SMPLX model files exist, auto-download if missing
@@ -216,9 +208,8 @@ class SMPLCameraViewer:
         ).to(device)
         smplx_model.eval()
 
-        smplx2smpl = torch.load(
-            str(data_dir / "smplx2smpl_sparse.pt"), weights_only=True
-        ).to(device)
+        from .body_model.utils import load_sparse_tensor
+        smplx2smpl = load_sparse_tensor(data_dir / "smplx2smpl_sparse.npz").to(device)
 
         faces = np.load(str(data_dir / "smpl_faces.npy"))
 
@@ -256,6 +247,53 @@ class SMPLCameraViewer:
 
         logger.info(f"[SMPLCameraViewer] Generated mesh: {num_output_frames} frames, "
                      f"{num_verts} vertices, {faces_u32.shape[0]} faces")
+
+        # Refine R_cam2world / t_cam2world via Procrustes alignment of actual vertices.
+        # The orientation-derived camera transform (R_body_world @ R_body_cam^T) doesn't
+        # account for SMPL's pose blend shapes which depend on global_orient, causing the
+        # world and incam meshes to differ by more than a rigid transform.  Procrustes
+        # on the actual vertex clouds gives a much more accurate camera extrinsic.
+        if has_camera and incam_vertices_array is not None:
+            logger.info("[SMPLCameraViewer] Refining camera via Procrustes alignment of vertices...")
+            R_refined = np.zeros((num_output_frames, 3, 3), dtype=np.float32)
+            t_refined = np.zeros((num_output_frames, 3), dtype=np.float32)
+            for fi in range(num_output_frames):
+                V_world = vertices_array[fi]   # (V, 3) -- world-frame vertices
+                V_incam = incam_vertices_array[fi]  # (V, 3) -- camera-frame vertices
+
+                # Centroids
+                mu_w = V_world.mean(axis=0)
+                mu_c = V_incam.mean(axis=0)
+
+                # Centered
+                W = V_world - mu_w
+                C = V_incam - mu_c
+
+                # Cross-covariance  H = C^T @ W  => we want R such that V_incam ~= R @ V_world + t
+                # i.e. camera-from-world: V_cam = R_w2c @ V_world + t_w2c
+                H = C.T @ W  # (3, 3)
+                U, S, Vt = np.linalg.svd(H)
+                # R_w2c = U @ Vt, with reflection correction
+                d = np.linalg.det(U @ Vt)
+                D = np.diag([1.0, 1.0, np.sign(d)])
+                R_w2c = U @ D @ Vt
+                t_w2c = mu_c - R_w2c @ mu_w
+
+                # Convert to cam2world
+                R_c2w = R_w2c.T
+                t_c2w = -R_c2w @ t_w2c
+
+                R_refined[fi] = R_c2w
+                t_refined[fi] = t_c2w
+
+            # Log improvement at frame 0
+            old_pos = t_cam2world_np[0]
+            new_pos = t_refined[0]
+            logger.info(f"[SMPLCameraViewer] Frame 0 camera pos: old={old_pos}, new={new_pos}")
+
+            R_cam2world_np = R_refined
+            t_cam2world_np = t_refined
+            logger.info("[SMPLCameraViewer] Camera refined via Procrustes alignment")
 
         # Write SMPC binary format
         output_dir = Path(folder_paths.get_output_directory())

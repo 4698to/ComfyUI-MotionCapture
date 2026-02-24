@@ -3,7 +3,6 @@ GVHMRInference Node - Performs motion capture inference on video with SAM3 masks
 """
 
 import os
-import sys
 from pathlib import Path
 import torch
 import folder_paths
@@ -12,57 +11,27 @@ import cv2
 from typing import Dict, Tuple
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Patch torch.nn.init to skip random weight initialization.
-# All models (ViTPose ~400M, HMR2 ~480M, GVHMR) are constructed with random
-# weights then immediately overwritten by load_state_dict(). Skipping the
-# random init saves significant time during model construction.
-# ---------------------------------------------------------------------------
-import torch.nn.init as _init
-
-def _noop(tensor, *args, **kwargs):
-    return tensor
-
-for _fn in (
-    "kaiming_uniform_", "kaiming_normal_",
-    "xavier_uniform_", "xavier_normal_",
-    "uniform_", "normal_", "trunc_normal_",
-    "ones_", "zeros_", "constant_",
-    "orthogonal_",
-):
-    if hasattr(_init, _fn):
-        setattr(_init, _fn, _noop)
-
-# Add nodes path for local utils (needed when run as subprocess)
-NODES_PATH = Path(__file__).parent
-sys.path.insert(0, str(NODES_PATH))
-
-# Add vendor path for GVHMR
-VENDOR_PATH = NODES_PATH / "vendor"
-sys.path.insert(0, str(VENDOR_PATH))
-
 # Import GVHMR components
-from hmr4d.utils.pylogger import Log
-from hmr4d.utils.geo.hmr_cam import get_bbx_xys_from_xyxy, estimate_K, create_camera_sensor
-from hmr4d.utils.geo_transform import compute_cam_angvel
-from hmr4d.utils.pytorch3d_shim import axis_angle_to_matrix
-from hmr4d.utils.smplx_utils import make_smplx
-from hmr4d.utils.net_utils import to_cuda
-from hmr4d.utils.preproc.relpose.simple_vo import SimpleVO
+from .motion_utils.pylogger import Log
+from .motion_utils.hmr_cam import get_bbx_xys_from_xyxy, estimate_K, create_camera_sensor
+from .motion_utils.geo_transform import compute_cam_angvel
+from .motion_utils.pytorch3d_shim import axis_angle_to_matrix
+from .body_model.smplx_utils import make_smplx
+from .motion_utils.simple_vo import SimpleVO
 
 # Check DPVO availability
 DPVO_AVAILABLE = False
 try:
-    from dpvo.dpvo import DPVO
-    from dpvo.config import cfg as dpvo_cfg
-    from dpvo.utils import Timer
+    from .dpvo.dpvo import DPVO
+    from .dpvo.config import cfg as dpvo_cfg
+    from .dpvo.utils import Timer
     DPVO_AVAILABLE = True
     Log.info("[GVHMRInference] DPVO is available")
-except ImportError:
+except Exception:
     Log.info("[GVHMRInference] DPVO not installed - only SimpleVO will be available")
 
 # Import local utilities (renamed to avoid conflict with ComfyUI's utils package)
-from gvhmr_utils import (
+from .gvhmr_utils import (
     extract_bbox_from_numpy_mask,
     bbox_to_xyxy,
     expand_bbox,
@@ -72,30 +41,19 @@ import gc
 import tempfile as tempfile_module
 
 
-def _next_sequential_filename(directory, prefix, ext):
-    """Find the next sequential filename like prefix_0001.ext, prefix_0002.ext, etc."""
-    existing = sorted(directory.glob(f"{prefix}_*{ext}"))
-    max_num = 0
-    for f in existing:
-        stem = f.stem  # e.g. "smpl_params_0003"
-        suffix = stem[len(prefix) + 1:]  # e.g. "0003"
-        try:
-            max_num = max(max_num, int(suffix))
-        except ValueError:
-            pass
-    return f"{prefix}_{max_num + 1:04d}{ext}"
+from .shared_utils import next_sequential_filename as _next_sequential_filename
 
 
 def _clear_cuda_memory():
-    """Clear CUDA memory cache between pipeline stages."""
+    """Clear GPU memory cache between pipeline stages."""
+    import comfy.model_management
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    comfy.model_management.soft_empty_cache()
 
 
 def _log_memory(label):
     """Log current process RSS memory usage (actual current, not peak)."""
+    import comfy.model_management
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -105,64 +63,30 @@ def _log_memory(label):
             else:
                 rss_mb = -1
         gpu_mb = ""
-        if torch.cuda.is_available():
+        if comfy.model_management.get_torch_device().type == "cuda":
             gpu_mb = f", GPU={torch.cuda.memory_allocated() / 1024**2:.0f} MB"
         Log.info(f"[Memory] {label}: RSS={rss_mb:.0f} MB{gpu_mb}")
     except Exception:
         Log.info(f"[Memory] {label}: (unable to read /proc/self/status)")
 
 
-def _release_shm_pages(tensor):
-    """Release shared memory pages from RSS via madvise(MADV_DONTNEED).
-    Call after data has been copied. Returns True on success."""
-    import ctypes
-    if sys.platform != "linux":
-        return False
-    try:
-        ptr = tensor.data_ptr()
-        size = tensor.nelement() * tensor.element_size()
-        if size == 0:
-            return False
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        page = os.sysconf("SC_PAGE_SIZE")
-        aligned = ptr & ~(page - 1)
-        ret = libc.madvise(ctypes.c_void_p(aligned), ctypes.c_size_t(size + ptr - aligned), 4)
-        if ret == 0:
-            Log.info(f"[Memory] madvise DONTNEED: released {size / 1024**2:.0f} MB")
-            return True
-        Log.info(f"[Memory] madvise failed: errno={ctypes.get_errno()}")
-        return False
-    except Exception as e:
-        Log.info(f"[Memory] madvise error: {e}")
-        return False
-
 
 def _save_tensor_to_disk(tensor, prefix="tensor"):
     """Save tensor to temp file and return path."""
-    fd, path = tempfile_module.mkstemp(suffix=".pt", prefix=prefix)
+    import safetensors.torch
+    fd, path = tempfile_module.mkstemp(suffix=".safetensors", prefix=prefix)
     os.close(fd)
-    torch.save(tensor.cpu(), path)
+    safetensors.torch.save_file({"t": tensor.cpu().contiguous()}, path)
     return path
 
 
-def _load_tensor_from_disk(path, device="cuda"):
+def _load_tensor_from_disk(path, device="cpu"):
     """Load tensor from disk and delete temp file."""
-    tensor = torch.load(path, map_location=device, weights_only=True)
+    import safetensors.torch
+    sd = safetensors.torch.load_file(path, device=str(device))
     os.remove(path)
-    return tensor
+    return sd["t"]
 
-
-def _save_temp_video(images_np: np.ndarray, fps: int = 30) -> str:
-    """Save numpy images to temporary video file for SimpleVO."""
-    import tempfile
-    temp_path = tempfile.mktemp(suffix=".mp4")
-    h, w = images_np.shape[1:3]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(temp_path, fourcc, fps, (w, h))
-    for frame in images_np:
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    writer.release()
-    return temp_path
 
 
 def _read_video_np(video_path: str) -> np.ndarray:
@@ -298,10 +222,6 @@ class GVHMRInference:
     Takes video frames and SAM3 masks, outputs SMPL parameters and 3D mesh.
     """
 
-    # Class-level model cache
-    _cached_model = None
-    _cached_config_hash = None
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -368,76 +288,124 @@ class GVHMRInference:
     CATEGORY = "MotionCapture/GVHMR"
 
     @classmethod
-    def _get_config_hash(cls, config: Dict) -> str:
-        """Generate hash of config for cache invalidation."""
-        import hashlib
-        config_str = str(sorted(config.items()))
-        return hashlib.md5(config_str.encode()).hexdigest()
-
-    @classmethod
     def _load_models(cls, config: Dict) -> Dict:
         """Load GVHMR models based on config."""
+        import comfy.model_management
+        import comfy.model_patcher
         from pathlib import Path
-        from hmr4d.configs import register_store_gvhmr
-        from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
-        from hmr4d.utils.preproc import VitPoseExtractor, Extractor
-        from hydra import initialize_config_module, compose
-        from hydra.core.global_hydra import GlobalHydra
-        from hydra.utils import instantiate
-        from omegaconf import OmegaConf
+        from .gvhmr import DemoPL, Pipeline, NetworkEncoderRoPE, EnDecoder
+        from .vitpose import VitPoseExtractor, Extractor
 
         Log.info("[GVHMRInference] Loading GVHMR models...")
 
         gvhmr_path = Path(config["gvhmr_path"])
 
-        # Initialize Hydra config for GVHMR
-        Log.info("[GVHMRInference] Initializing GVHMR configuration...")
-        if GlobalHydra.instance().is_initialized():
-            GlobalHydra.instance().clear()
-        with initialize_config_module(version_base="1.3", config_module="hmr4d.configs"):
-            register_store_gvhmr()
-            cfg = compose(config_name="demo", overrides=["static_cam=True", "verbose=False"])
+        # Resolve precision using ComfyUI native detection
+        precision = config.get("precision", "auto")
+        if precision == "auto":
+            device = comfy.model_management.get_torch_device()
+            if comfy.model_management.should_use_bf16(device):
+                dtype = torch.bfloat16
+            elif comfy.model_management.should_use_fp16(device):
+                dtype = torch.float16
+            else:
+                dtype = torch.float32
+        elif precision == "bf16":
+            dtype = torch.bfloat16
+        elif precision == "fp16":
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+        Log.info(f"[GVHMRInference] Precision: {dtype}")
 
-        # Check if rendering is available
-        try:
-            from hmr4d.utils.vis.renderer import PYTORCH3D_AVAILABLE
-            if not PYTORCH3D_AVAILABLE:
-                Log.warn("[GVHMRInference] PyTorch3D not installed - visualization rendering will be disabled")
-        except Exception:
-            pass
-
-        # Load GVHMR model
+        # Build GVHMR model directly (no Hydra)
         Log.info(f"[GVHMRInference] Loading GVHMR from {gvhmr_path}...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = str(comfy.model_management.get_torch_device())
 
-        # Instantiate DemoPL with pipeline from config
-        model_cfg_dict = OmegaConf.to_container(cfg.model, resolve=True)
-        model_cfg = OmegaConf.create(model_cfg_dict)
+        with torch.device("meta"):
+            denoiser3d = NetworkEncoderRoPE(
+                output_dim=151,
+                max_len=120,
+                cliffcam_dim=3,
+                cam_angvel_dim=6,
+                imgseq_dim=1024,
+                latent_dim=512,
+                num_layers=12,
+                num_heads=8,
+                mlp_ratio=4.0,
+                pred_cam_dim=3,
+                static_conf_dim=6,
+                dropout=0.1,
+                avgbeta=True,
+            )
+            endecoder = EnDecoder(
+                stats_name="MM_V1_AMASS_LOCAL_BEDLAM_CAM",
+                noise_pose_k=10,
+            )
+            pipeline = Pipeline(
+                denoiser3d=denoiser3d,
+                endecoder=endecoder,
+                normalize_cam_angvel=True,
+                weights=None,
+                static_conf=None,
+            )
+            model_gvhmr = DemoPL(pipeline=pipeline)
 
-        model_gvhmr = instantiate(model_cfg, _recursive_=False)
         model_gvhmr.load_pretrained_model(str(gvhmr_path))
         model_gvhmr.eval()
-        model_gvhmr.to(device)
-        gc.collect()  # free CPU state_dict copies before loading next model
-        _log_memory("After GVHMR model loaded")
 
-        # Initialize preprocessing components
+        # Safety net: reinitialize any stray meta-device buffers before .to()
+        # (persistent=False buffers aren't in checkpoint and may still be on meta)
+        for module in model_gvhmr.modules():
+            for name, buf in list(module._buffers.items()):
+                if buf is not None and buf.device.type == "meta":
+                    Log.warn(f"[GVHMRInference] Reinitializing meta buffer: {type(module).__name__}.{name}")
+                    module._buffers[name] = torch.zeros_like(buf, device="cpu")
+
+        model_gvhmr.to(dtype=dtype)
+        # Keep the endecoder (SMPL body model + affine decoder) in float32.
+        # It's not part of the neural network — just topology data and mean/std stats.
+        # Postprocessing utility libraries (IK, quaternion, matrix) assume float32.
+        model_gvhmr.pipeline.endecoder.float()
+
+        # Initialize preprocessing components (paths from config, stay on CPU)
         Log.info("[GVHMRInference] Initializing ViTPose extractor...")
-        vitpose_extractor = VitPoseExtractor()
-        gc.collect()
-        _log_memory("After ViTPose loaded")
+        vitpose_extractor = VitPoseExtractor(dtype=dtype, ckpt_path=config.get("vitpose_path"))
 
         Log.info("[GVHMRInference] Initializing feature extractor...")
-        feature_extractor = Extractor()
-        gc.collect()
-        _log_memory("After feature extractor loaded")
+        feature_extractor = Extractor(dtype=dtype, ckpt_path=config.get("hmr2_path"))
 
-        # Create model bundle
+        # Wrap all models in ModelPatcher for ComfyUI VRAM management
+        from .lowvram import _enable_lowvram_cast
+
+        load_device = comfy.model_management.get_torch_device()
+        offload_device = comfy.model_management.unet_offload_device()
+
+        _enable_lowvram_cast(model_gvhmr)
+        gvhmr_patcher = comfy.model_patcher.ModelPatcher(
+            model_gvhmr, load_device=load_device, offload_device=offload_device,
+        )
+
+        _enable_lowvram_cast(vitpose_extractor.pose)
+        vitpose_patcher = comfy.model_patcher.ModelPatcher(
+            vitpose_extractor.pose, load_device=load_device, offload_device=offload_device,
+        )
+
+        _enable_lowvram_cast(feature_extractor.extractor)
+        hmr2_patcher = comfy.model_patcher.ModelPatcher(
+            feature_extractor.extractor, load_device=load_device, offload_device=offload_device,
+        )
+
+        gc.collect()
+        _log_memory("After all models loaded")
+
         model_bundle = {
             "gvhmr": model_gvhmr,
             "vitpose_extractor": vitpose_extractor,
             "feature_extractor": feature_extractor,
-            "config": cfg,
+            "gvhmr_patcher": gvhmr_patcher,
+            "vitpose_patcher": vitpose_patcher,
+            "hmr2_patcher": hmr2_patcher,
             "device": device,
             "paths": config,
         }
@@ -448,28 +416,8 @@ class GVHMRInference:
     @classmethod
     def _get_or_load_model(cls, config: Dict) -> Dict:
         """Get cached model or load new one based on config."""
-        config_hash = cls._get_config_hash(config)
-        cache_model = config.get("cache_model", False)
-
-        # Check if we have a valid cached model
-        if cache_model and cls._cached_model is not None and cls._cached_config_hash == config_hash:
-            Log.info("[GVHMRInference] Using cached model")
-            return cls._cached_model
-
-        # Load fresh model
-        model_bundle = cls._load_models(config)
-
-        # Cache if requested
-        if cache_model:
-            cls._cached_model = model_bundle
-            cls._cached_config_hash = config_hash
-            Log.info("[GVHMRInference] Model cached for future runs")
-        else:
-            # Clear any existing cache
-            cls._cached_model = None
-            cls._cached_config_hash = None
-
-        return model_bundle
+        # Load fresh model each time — comfy-env handles GPU memory management
+        return cls._load_models(config)
 
     def prepare_data_from_videos(
         self,
@@ -490,6 +438,7 @@ class GVHMRInference:
         Prepare data dictionary for GVHMR inference from VIDEO inputs.
         Reads frames chunk-by-chunk from video files to minimize RAM usage.
         """
+        import comfy.model_management
         import av
 
         device = model_bundle["device"]
@@ -553,21 +502,16 @@ class GVHMRInference:
         # --- Phase 2: Two-pass frame processing (GPU memory optimization) ---
         # Only one large model on GPU at a time (~2.7 GB peak vs ~5.2 GB).
         # Cropped 256×256 tensors saved between passes (~0.75 MB/frame).
-        from hmr4d.utils.preproc.vitfeat_extractor import get_batch
+        from .vitpose.feat_extractor import get_batch
 
         vitpose_extractor = model_bundle["vitpose_extractor"]
         feature_extractor = model_bundle["feature_extractor"]
 
         CHUNK_SIZE = max(1, chunk_size)
 
-        # Move both extractors off GPU — only GVHMR stays (~173 MB)
-        vitpose_extractor.pose.cpu()
-        feature_extractor.extractor.cpu()
-        _clear_cuda_memory()
-        _log_memory("After moving extractors to CPU")
-
         # --- Pass 1: ViTPose (decode video + crop + extract keypoints) ---
-        vitpose_extractor.pose.cuda()
+        # Load ViTPose onto GPU (ModelPatcher automatically offloads other models)
+        comfy.model_management.load_models_gpu([model_bundle["vitpose_patcher"]])
         _log_memory("ViTPose on GPU")
 
         all_kp2d = []
@@ -632,13 +576,9 @@ class GVHMRInference:
             _video_writer.release()
             _video_writer = None
 
-        # Swap models: ViTPose off, HMR2 on
-        vitpose_extractor.pose.cpu()
-        _clear_cuda_memory()
-        _log_memory("ViTPose off GPU")
-
         # --- Pass 2: HMR2 (iterate saved crops — no video decoding) ---
-        feature_extractor.extractor.cuda()
+        # Load HMR2 onto GPU (ModelPatcher automatically offloads ViTPose)
+        comfy.model_management.load_models_gpu([model_bundle["hmr2_patcher"]])
         _log_memory("HMR2 on GPU")
 
         all_f_imgseq = []
@@ -653,10 +593,8 @@ class GVHMRInference:
 
         del saved_crops
         gc.collect()
-
-        feature_extractor.extractor.cpu()
         _clear_cuda_memory()
-        _log_memory("HMR2 off GPU")
+        _log_memory("After HMR2 pass")
 
         # Concatenate results from all chunks
         kp2d = torch.cat(all_kp2d, dim=0)
@@ -757,9 +695,7 @@ class GVHMRInference:
                     Log.info("[GVHMRInference] Temp video cleaned up")
 
             except Exception as e:
-                Log.error(f"[GVHMRInference] Visual odometry failed: {e}")
-                import traceback
-                traceback.print_exc()
+                Log.error(f"[GVHMRInference] Visual odometry failed: {e}", exc_info=True)
                 Log.warn("[GVHMRInference] Falling back to static camera")
                 R_w2c = torch.eye(3).repeat(batch_size, 1, 1)
                 t_w2c = None
@@ -821,6 +757,7 @@ class GVHMRInference:
         Run GVHMR inference on video with mask video.
         Reads frames directly from video files — no large float32 tensors in RAM.
         """
+        import comfy.model_management
         try:
             static_camera = not moving_camera
             Log.info("=" * 60)
@@ -836,7 +773,6 @@ class GVHMRInference:
             Log.info(f"  intrinsics:      {intrinsics.shape if intrinsics is not None else 'None'}")
             Log.info(f"  chunk_size:      {chunk_size}")
             Log.info(f"  config keys:     {list(config.keys())}")
-            Log.info(f"  cache_model:     {config.get('cache_model', False)}")
             Log.info(f"  dpvo_dir:        {config.get('dpvo_dir', '')}")
             Log.info("=" * 60)
             _log_memory("Start of run_inference")
@@ -863,7 +799,8 @@ class GVHMRInference:
                 data["f_imgseq_path"] = None
                 Log.info("[GVHMRInference] Features reloaded from disk")
 
-            # Run GVHMR inference
+            # Run GVHMR inference — load onto GPU (ModelPatcher offloads HMR2 automatically)
+            comfy.model_management.load_models_gpu([model["gvhmr_patcher"]])
             _log_memory("Before GVHMR predict")
             Log.info(f"[GVHMRInference] Running GVHMR model (static_cam={static_camera})...")
             gvhmr_model = model["gvhmr"]
@@ -970,20 +907,15 @@ class GVHMRInference:
 
             Log.info("[GVHMRInference] Inference complete!")
 
-            # Clear model from memory if not caching
-            if not config.get("cache_model", False):
-                Log.info("[GVHMRInference] Clearing model from memory (cache_model=False)")
-                del model
-                _clear_cuda_memory()
+            del model
+            _clear_cuda_memory()
 
             _log_memory("Final (before return)")
             return (str(npz_path), camera_npz_path_str, info)
 
         except Exception as e:
             error_msg = f"GVHMR Inference failed: {str(e)}"
-            Log.error(error_msg)
-            import traceback
-            traceback.print_exc()
+            Log.error(error_msg, exc_info=True)
             # Return placeholder on error
             return ("", "", error_msg)
 
