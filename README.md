@@ -17,6 +17,13 @@ https://github.com/user-attachments/assets/17638ca5-8139-40ca-b215-0d7dabf0ea73
 
 https://github.com/user-attachments/assets/ba7a7797-713d-4750-9210-ff07bcc6bb01
 
+
+https://github.com/user-attachments/assets/d0b1d43e-a291-418a-816c-8c88e470bad4
+
+
+https://github.com/user-attachments/assets/b90ad09f-ea4f-4b2f-a8a7-70e53c1f4618
+
+
 ## Installation
 
 Please always install through ComfyUI-Manager
