@@ -209,12 +209,11 @@ class SMPLtoBVH:
                     "step": 0.01,
                     "round": 0.01,
                 }),
-                "bvh_naming": ("STRING", {
-                    "default": "SMPL_21_JOINT_NAMES",
-                    "choices": ["SMPL_21_JOINT_NAMES", "SMPL_21_JOINT_NAMES_BIPED"],
-                    "tooltip": "BVH 关节命名风格（仅 21 关节骨架有效）"
-                }),
+                
             },
+            "optional": {
+                "bvh_naming": (["SMPL_21_JOINT_NAMES", "SMPL_21_JOINT_NAMES_BIPED"],),
+            }
         }
 
     RETURN_TYPES = ("BVH_DATA", "STRING", "STRING")
